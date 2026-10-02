@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         KaHoax
-// @version      1.1.4.1
+// @version      1.1.5.0
 // @description  A hack for kahoot.it! First tries proxy lookup by Quiz ID. If that fails, uses fallback search and displays a scrollable dropdown for selection.
 // @namespace    https://github.com/KRWCLASSIC
 // @match        https://kahoot.it/*
@@ -8,7 +8,7 @@
 // @grant        none
 // ==/UserScript==
 (function() {
-    var Version = '1.1.4.1';
+    var Version = '1.1.5.0';
 
     var questions = [];
     var info = {
@@ -24,6 +24,16 @@
     var showAnswers = false;
     var inputLag = 100; // Ping compensation
     var lastValidQuizID = null; // Store the last successfully loaded quiz ID
+    var autoFinderState = {
+        lastTitle: '',
+        lastQuestionSignature: '',
+        candidates: [],
+        titleLookupInProgress: false,
+        questionMatchInProgress: false,
+        resolved: false,
+        nextTickAt: 0
+    };
+    const quizDataCache = new Map();
 
     // Helper: Finds an element by attribute value.
     function FindByAttributeValue(attribute, value, element_type) {
@@ -55,6 +65,112 @@
         // UUID pattern: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
         const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
         return uuidPattern.test(str);
+    }
+
+    function normalizeText(text) {
+        if (!text) return '';
+        return text
+            .toString()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&nbsp;/g, ' ')
+            .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function getVisibleTextFromSelectors(selectors) {
+        for (const selector of selectors) {
+            const nodes = document.querySelectorAll(selector);
+            for (const node of nodes) {
+                if (!node) continue;
+                const style = window.getComputedStyle(node);
+                if (style && style.display === 'none') continue;
+                const text = (node.textContent || '').trim();
+                if (text) return text;
+            }
+        }
+        return '';
+    }
+
+    function detectQuizTitle() {
+        const titleFromDom = getVisibleTextFromSelectors([
+            '[data-functional-selector="game-title"]',
+            '[data-functional-selector="bottom-bar-game-title"]',
+            '[data-functional-selector="content-title"]',
+            '[data-selector="game-title"]',
+            '[class*="game-title"]',
+            '[class*="quiz-title"]'
+        ]);
+        if (titleFromDom) return titleFromDom;
+        const pageTitle = (document.title || '').replace(/\s*[-|–]\s*kahoot!?$/i, '').trim();
+        return pageTitle && pageTitle.toLowerCase() !== 'kahoot!' ? pageTitle : '';
+    }
+
+    function detectQuestionText() {
+        return getVisibleTextFromSelectors([
+            '[data-functional-selector="question-title"]',
+            '[data-functional-selector="question-text"]',
+            '[data-selector="question-title"]',
+            '[data-selector="question-text"]',
+            '[class*="question-title"]',
+            '[class*="question-text"]'
+        ]);
+    }
+
+    function getQuestionIndexFromUi() {
+        const counterCandidates = document.querySelectorAll('[data-functional-selector="question-index-counter"], [data-functional-selector*="question-index"], [data-selector*="question-index"]');
+        for (const node of counterCandidates) {
+            const raw = (node.textContent || '').trim();
+            if (!raw) continue;
+            const slashMatch = raw.match(/(\d+)\s*\/\s*\d+/);
+            if (slashMatch) return Math.max(0, Number(slashMatch[1]) - 1);
+            const singleMatch = raw.match(/\d+/);
+            if (singleMatch) return Math.max(0, Number(singleMatch[0]) - 1);
+        }
+        return info.questionNum;
+    }
+
+    function getAnswerButtons() {
+        const selectors = [
+            'button[data-functional-selector^="answer-"]',
+            '[data-functional-selector^="answer-"] button',
+            'button[data-selector^="answer-"]',
+            '[data-selector^="answer-"] button',
+            'button[data-testid^="answer-"]'
+        ];
+        const seen = new Set();
+        const buttons = [];
+        selectors.forEach(selector => {
+            document.querySelectorAll(selector).forEach(node => {
+                const button = node.tagName === 'BUTTON' ? node : node.closest('button');
+                if (!button) return;
+                const key = button.getAttribute('data-functional-selector') || button.getAttribute('data-selector') || button.getAttribute('data-testid') || button.outerHTML.slice(0, 80);
+                if (seen.has(key)) return;
+                if (!button.isConnected || button.disabled) return;
+                seen.add(key);
+                buttons.push(button);
+            });
+        });
+        return buttons;
+    }
+
+    function findAnswerButton(index) {
+        const directSelectors = [
+            `button[data-functional-selector="answer-${index}"]`,
+            `[data-functional-selector="answer-${index}"] button`,
+            `button[data-selector="answer-${index}"]`,
+            `[data-selector="answer-${index}"] button`,
+            `button[data-testid="answer-${index}"]`
+        ];
+        for (const selector of directSelectors) {
+            const node = document.querySelector(selector);
+            if (!node) continue;
+            const button = node.tagName === 'BUTTON' ? node : node.closest('button');
+            if (button) return button;
+        }
+        const allButtons = getAnswerButtons();
+        return allButtons[index] || null;
     }
 
     // Function to update the questions list in the browser
@@ -287,6 +403,8 @@
         info.numQuestions = 0;
         info.questionNum = -1;
         info.lastAnsweredQuestion = -1;
+        autoFinderState.resolved = false;
+        autoFinderState.lastQuestionSignature = '';
         questionsLabel.textContent = 'Question 0 / ?';
         
         // Reset questions browser
@@ -1477,23 +1595,117 @@
         isDragging = false;
     });
 
+    async function fetchSearchResults(searchTerm) {
+        const searchUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/rest/kahoots/?query=' + encodeURIComponent(searchTerm);
+        const response = await fetch(searchUrl);
+        const data = await response.json();
+        const entities = Array.isArray(data?.entities) ? data.entities : [];
+        return entities
+            .map(entity => {
+                const card = entity.card || {};
+                return {
+                    title: card.title || card.name || 'No title',
+                    cover: card.cover || card.image || 'https://dummyimage.com/50x50/ccc/fff.png&text=No+Image',
+                    uuid: card.uuid || card.id || ''
+                };
+            })
+            .filter(item => item.uuid);
+    }
+
+    async function fetchQuizData(quizID) {
+        if (quizDataCache.has(quizID)) return quizDataCache.get(quizID);
+        const quizUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(quizID);
+        const response = await fetch(quizUrl);
+        if (!response.ok) throw new Error('Quiz lookup failed');
+        const data = await response.json();
+        quizDataCache.set(quizID, data);
+        return data;
+    }
+
+    async function loadQuizById(quizID, options = {}) {
+        const { updateInputColor = true } = options;
+        try {
+            const data = await fetchQuizData(quizID);
+            inputBox.value = quizID;
+            if (updateInputColor) inputBox.style.backgroundColor = 'green';
+            dropdown.style.display = 'none';
+            dropdownCloseButton.style.display = 'none';
+            questions = parseQuestions(data.questions || []);
+            info.numQuestions = questions.length;
+            lastValidQuizID = quizID;
+            autoFinderState.resolved = true;
+            updateQuestionsList(data.questions || []);
+            return true;
+        } catch (error) {
+            if (updateInputColor) inputBox.style.backgroundColor = 'red';
+            questions = [];
+            info.numQuestions = 0;
+            return false;
+        }
+    }
+
+    async function tryResolveQuizFromQuestion(questionText) {
+        const signature = normalizeText(questionText);
+        if (!signature || signature.length < 8 || autoFinderState.questionMatchInProgress || autoFinderState.resolved) return;
+        if (!autoFinderState.candidates.length || autoFinderState.lastQuestionSignature === signature) return;
+        autoFinderState.questionMatchInProgress = true;
+        autoFinderState.lastQuestionSignature = signature;
+        try {
+            for (const candidate of autoFinderState.candidates.slice(0, 8)) {
+                try {
+                    const data = await fetchQuizData(candidate.uuid);
+                    const hasMatchingQuestion = (data.questions || []).some(q => {
+                        const normalizedQuestion = normalizeText(q.question || '');
+                        return normalizedQuestion && (normalizedQuestion.includes(signature) || signature.includes(normalizedQuestion));
+                    });
+                    if (hasMatchingQuestion) {
+                        await loadQuizById(candidate.uuid, { updateInputColor: true });
+                        return;
+                    }
+                } catch (err) {
+                    console.error('Candidate check failed:', err);
+                }
+            }
+        } finally {
+            autoFinderState.questionMatchInProgress = false;
+        }
+    }
+
+    async function runAutoQuizFinder() {
+        if (autoFinderState.titleLookupInProgress) return;
+        const detectedTitle = detectQuizTitle();
+        const normalizedTitle = normalizeText(detectedTitle);
+        if (!normalizedTitle || normalizedTitle.length < 4) return;
+        if (autoFinderState.lastTitle === normalizedTitle && autoFinderState.candidates.length > 0) return;
+        autoFinderState.titleLookupInProgress = true;
+        try {
+            autoFinderState.lastTitle = normalizedTitle;
+            autoFinderState.lastQuestionSignature = '';
+            autoFinderState.resolved = false;
+            const candidates = await fetchSearchResults(detectedTitle);
+            autoFinderState.candidates = candidates.slice(0, 10);
+            const exactTitleMatches = autoFinderState.candidates.filter(candidate => normalizeText(candidate.title) === normalizedTitle);
+            if (exactTitleMatches.length === 1) {
+                await loadQuizById(exactTitleMatches[0].uuid, { updateInputColor: true });
+            }
+        } catch (error) {
+            console.error('Auto quiz finder failed:', error);
+        } finally {
+            autoFinderState.titleLookupInProgress = false;
+        }
+    }
+
     // --- Fallback Dropdown Search ---
     function searchPublicUUID(searchTerm) {
-        const searchUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/rest/kahoots/?query=' + encodeURIComponent(searchTerm);
-        console.log("Fallback search URL:", searchUrl);
-        fetch(searchUrl)
-          .then(response => response.json())
-          .then(data => {
-              console.log("Fallback search data:", data);
-              let results = (data.entities && data.entities.length > 0) ? data.entities : [];
+        fetchSearchResults(searchTerm)
+          .then(results => {
               dropdown.innerHTML = "";
               if (Array.isArray(results) && results.length > 0) {
                   dropdown.appendChild(dropdownHeader); // Re-add the header with X button
-                  results.forEach(entity => {
-                      let card = entity.card || {};
-                      let displayTitle = card.title || card.name || "No title";
-                      let displayCover = card.cover || card.image || 'https://dummyimage.com/50x50/ccc/fff.png&text=No+Image';
-                      let quizUUID = card.uuid || card.id || "";
+                  results.forEach(result => {
+                      let displayTitle = result.title;
+                      let displayCover = result.cover;
+                      let quizUUID = result.uuid;
                       const item = document.createElement('div');
                       item.style.display = 'flex';
                       item.style.alignItems = 'center';
@@ -1527,11 +1739,8 @@
                       item.appendChild(text);
                       
                     item.addEventListener('click', async function() {
-                        const quizUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(quizUUID);
                         try {
-                            const res = await fetch(quizUrl);
-                            if (!res.ok) throw new Error("Fetch failed");
-                            const data = await res.json();
+                            const data = await fetchQuizData(quizUUID);
                         
                             // If we already have the expanded view, do nothing (avoid duplicates)
                             if (item.classList.contains('expanded-item')) {
@@ -1540,17 +1749,6 @@
                             
                             // Mark this item as expanded
                             item.classList.add('expanded-item');
-                            
-                            // Save original item styles and content
-                            const originalItemStyles = {
-                                display: item.style.display,
-                                alignItems: item.style.alignItems,
-                                padding: item.style.padding,
-                                cursor: item.style.cursor,
-                                borderBottom: item.style.borderBottom,
-                                backgroundColor: item.style.backgroundColor,
-                            };
-                            const originalContent = item.innerHTML;
                             
                             // Clear existing content
                             item.innerHTML = '';
@@ -1810,12 +2008,12 @@
                                 selectButton.style.backgroundColor = '#6c757d';
                             });
 
-                            selectButton.addEventListener('click', (e) => {
+                            selectButton.addEventListener('click', async (e) => {
                                 e.stopPropagation(); // Prevent triggering the header click
                                 inputBox.value = quizUUID;
                                 dropdown.style.display = 'none';
                                 dropdownCloseButton.style.display = 'none';
-                                handleInputChange();
+                                await loadQuizById(quizUUID, { updateInputColor: true });
                             });
 
                             contentContainer.appendChild(selectButton);
@@ -1873,36 +2071,20 @@
     }
 
     // --- Lookup Function ---
-    function handleInputChange() {
+    async function handleInputChange() {
         var rawInput = inputBox.value;
         var quizID = sanitizeInput(rawInput);
-        const url = 'https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(quizID);
-        console.log("Direct lookup URL:", url);
         if (quizID !== "") {
-            fetch(url)
-                .then(response => {
-                    if (!response.ok) throw new Error('Direct lookup failed');
-                    return response.json();
-                })
-                .then(data => {
-                    console.log("Direct lookup data:", data);
-                    inputBox.style.backgroundColor = 'green';
-                    dropdown.style.display = 'none';
-                    dropdownCloseButton.style.display = 'none';
-                    questions = parseQuestions(data.questions);
-                    info.numQuestions = questions.length;
-                    lastValidQuizID = quizID; // Store the last valid quiz ID
-                    
-                    // Update the questions browser
-                    updateQuestionsList(data.questions);
-                })
-                .catch(error => {
-                    console.error("Direct lookup error:", error);
-                    inputBox.style.backgroundColor = 'red';
-                    info.numQuestions = 0;
-                    // Fallback: offer public search suggestions.
+            if (isValidGameId(quizID)) {
+                const loaded = await loadQuizById(quizID, { updateInputColor: true });
+                if (!loaded) {
                     searchPublicUUID(quizID);
-                });
+                }
+                return;
+            }
+            inputBox.style.backgroundColor = '#333333';
+            info.numQuestions = 0;
+            searchPublicUUID(quizID);
         } else {
             inputBox.style.backgroundColor = '#333333';
             info.numQuestions = 0;
@@ -1926,6 +2108,7 @@
     resizeObserver.observe(uiElement);
 
     function parseQuestions(questionsJson){
+        if (!Array.isArray(questionsJson)) return [];
         let questions = [];
         questionsJson.forEach(function (question){
             let q = {type: question.type, time: question.time};
@@ -1933,7 +2116,7 @@
                 var i = 0;
                 q.answers = [];
                 q.incorrectAnswers = [];
-                question.choices.forEach(function(choice){
+                (question.choices || []).forEach(function(choice){
                     if (choice.correct) {
                         q.answers.push(i);
                     } else {
@@ -1944,7 +2127,7 @@
             }
             if (question.type == 'open_ended') {
                 q.answers = [];
-                question.choices.forEach(function(choice){
+                (question.choices || []).forEach(function(choice){
                     q.answers.push(choice.answer);
                 });
             }
@@ -1980,37 +2163,51 @@
     }
 
     function answer(question, time) {
+        if (!question) return;
         Answered_PPT = PPT;
         var delay = (question.type == 'multiple_select_quiz') ? 60 : 0;
         setTimeout(function() {
             if (question.type == 'quiz') {
-                const key = (+question.answers[0] + 1).toString();
-                const event = new KeyboardEvent('keydown', { key: key });
-                window.dispatchEvent(event);
+                const answerIndex = +question.answers[0];
+                const answerButton = findAnswerButton(answerIndex);
+                if (answerButton) {
+                    answerButton.click();
+                } else {
+                    const key = (answerIndex + 1).toString();
+                    const event = new KeyboardEvent('keydown', { key: key });
+                    window.dispatchEvent(event);
+                }
             }
             if (question.type == 'multiple_select_quiz') {
-                question.answers.forEach(function(answer) {
+                question.answers.forEach(function(answerIndex) {
                     setTimeout(function() {
-                        const key = (+answer + 1).toString();
-                        const event = new KeyboardEvent('keydown', { key: key });
-                        window.dispatchEvent(event);
-                    }, 0);
+                        const answerButton = findAnswerButton(+answerIndex);
+                        if (answerButton) {
+                            answerButton.click();
+                        } else {
+                            const key = (+answerIndex + 1).toString();
+                            const event = new KeyboardEvent('keydown', { key: key });
+                            window.dispatchEvent(event);
+                        }
+                    }, 20);
                 });
                 setTimeout(function() {
-                    const submitButton = FindByAttributeValue("data-functional-selector", 'multi-select-submit-button', "button");
+                    const submitButton = FindByAttributeValue("data-functional-selector", 'multi-select-submit-button', "button") ||
+                        document.querySelector('button[data-selector="multi-select-submit-button"]') ||
+                        document.querySelector('button[data-testid="multi-select-submit-button"]');
                     if (submitButton) submitButton.click();
-                }, 0);
+                }, 120);
             }
-        }, time - delay);
+        }, Math.max(0, time - delay));
     }
 
     // Interval loop: checks question state, auto-answer logic, etc.
     setInterval(function () {
-        var textElement = FindByAttributeValue("data-functional-selector", "question-index-counter", "div");
-        if (textElement){
-            info.questionNum = +textElement.textContent - 1;
+        const questionIndex = getQuestionIndexFromUi();
+        if (Number.isFinite(questionIndex) && questionIndex >= 0) {
+            info.questionNum = questionIndex;
         }
-        if (FindByAttributeValue("data-functional-selector", 'answer-0', "button") && info.lastAnsweredQuestion != info.questionNum) {
+        if (getAnswerButtons().length > 0 && info.lastAnsweredQuestion != info.questionNum) {
             info.lastAnsweredQuestion = info.questionNum;
             onQuestionStart();
         }
@@ -2035,6 +2232,18 @@
         }
         // Update question label - use "?" for total if no questions loaded
         questionsLabel.textContent = 'Question ' + (info.questionNum + 1) + ' / ' + (info.numQuestions > 0 ? info.numQuestions : '?');
+
+        const now = Date.now();
+        if (now >= autoFinderState.nextTickAt) {
+            autoFinderState.nextTickAt = now + 1200;
+            if (!lastValidQuizID || info.numQuestions === 0) {
+                runAutoQuizFinder();
+            }
+            const liveQuestionText = detectQuestionText();
+            if (liveQuestionText) {
+                tryResolveQuizFromQuestion(liveQuestionText);
+            }
+        }
         
         // Check for game PIN
         try {
