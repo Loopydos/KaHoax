@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         KaHoax
-// @version      1.1.5.0
+// @version      1.1.5.1
 // @description  A hack for kahoot.it! First tries proxy lookup by Quiz ID. If that fails, uses fallback search and displays a scrollable dropdown for selection.
 // @namespace    https://github.com/KRWCLASSIC
 // @match        https://kahoot.it/*
@@ -8,13 +8,14 @@
 // @grant        none
 // ==/UserScript==
 (function() {
-    var Version = '1.1.5.0';
+    var Version = '1.1.5.1';
 
     var questions = [];
     var info = {
         numQuestions: 0,
         questionNum: -1,
         lastAnsweredQuestion: -1,
+        lastQuestionSignature: '',
         defaultIL: true,
         ILSetQuestion: -1,
     };
@@ -137,13 +138,16 @@
             '[data-functional-selector^="answer-"] button',
             'button[data-selector^="answer-"]',
             '[data-selector^="answer-"] button',
-            'button[data-testid^="answer-"]'
+            'button[data-testid^="answer-"]',
+            '[data-functional-selector^="answer-"][role="button"]',
+            '[data-selector^="answer-"][role="button"]',
+            '[data-testid^="answer-"][role="button"]'
         ];
         const seen = new Set();
         const buttons = [];
         selectors.forEach(selector => {
             document.querySelectorAll(selector).forEach(node => {
-                const button = node.tagName === 'BUTTON' ? node : node.closest('button');
+                const button = node.tagName === 'BUTTON' ? node : (node.closest('button') || node);
                 if (!button) return;
                 const key = button.getAttribute('data-functional-selector') || button.getAttribute('data-selector') || button.getAttribute('data-testid') || button.outerHTML.slice(0, 80);
                 if (seen.has(key)) return;
@@ -161,16 +165,47 @@
             `[data-functional-selector="answer-${index}"] button`,
             `button[data-selector="answer-${index}"]`,
             `[data-selector="answer-${index}"] button`,
-            `button[data-testid="answer-${index}"]`
+            `button[data-testid="answer-${index}"]`,
+            `[data-functional-selector="answer-${index}"][role="button"]`,
+            `[data-selector="answer-${index}"][role="button"]`,
+            `[data-testid="answer-${index}"][role="button"]`
         ];
         for (const selector of directSelectors) {
             const node = document.querySelector(selector);
             if (!node) continue;
-            const button = node.tagName === 'BUTTON' ? node : node.closest('button');
+            const button = node.tagName === 'BUTTON' ? node : (node.closest('button') || node);
             if (button) return button;
         }
         const allButtons = getAnswerButtons();
         return allButtons[index] || null;
+    }
+
+    function clickAnswerTarget(element) {
+        if (!element || !element.isConnected) return false;
+        try {
+            element.click();
+            return true;
+        } catch (e) {}
+        try {
+            ['mousedown', 'mouseup', 'click'].forEach(type => {
+                element.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+            });
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function resolveQuestionIndex() {
+        const uiIndex = getQuestionIndexFromUi();
+        if (Number.isFinite(uiIndex) && uiIndex >= 0 && uiIndex < questions.length) return uiIndex;
+        if (Number.isFinite(info.questionNum) && info.questionNum >= 0 && info.questionNum < questions.length) return info.questionNum;
+        if (questions.length > 0) {
+            const nextIndex = info.lastAnsweredQuestion + 1;
+            if (nextIndex >= 0 && nextIndex < questions.length) return nextIndex;
+            return Math.min(Math.max(info.lastAnsweredQuestion, 0), questions.length - 1);
+        }
+        return -1;
     }
 
     // Function to update the questions list in the browser
@@ -403,6 +438,7 @@
         info.numQuestions = 0;
         info.questionNum = -1;
         info.lastAnsweredQuestion = -1;
+        info.lastQuestionSignature = '';
         autoFinderState.resolved = false;
         autoFinderState.lastQuestionSignature = '';
         questionsLabel.textContent = 'Question 0 / ?';
@@ -2138,40 +2174,49 @@
 
     function onQuestionStart(){
         console.log("onQuestionStart, inputLag =", inputLag);
-        var question = questions[info.questionNum];
+        const resolvedIndex = resolveQuestionIndex();
+        if (resolvedIndex < 0 || resolvedIndex >= questions.length) return;
+        info.questionNum = resolvedIndex;
+        var question = questions[resolvedIndex];
+        if (!question) return;
         if (showAnswers){
             highlightAnswers(question);
         }
         if (autoAnswer){
-            answer(question, (question.time - question.time / (500/(PPT-500))) - inputLag);
+            if (typeof question.time === 'number' && question.time > 0) {
+                answer(question, (question.time - question.time / (500/(PPT-500))) - inputLag);
+            } else {
+                answer(question, 0);
+            }
         }
     }
 
     function highlightAnswers(question){
+        if (!question || !Array.isArray(question.answers) || !Array.isArray(question.incorrectAnswers)) return;
         question.answers.forEach(function (answer) {
             setTimeout(function() {
-                const answerButton = FindByAttributeValue("data-functional-selector", 'answer-' + answer, "button");
+                const answerButton = findAnswerButton(+answer);
                 if (answerButton) answerButton.style.backgroundColor = 'rgb(0, 255, 0)';
             }, 0);
         });
         question.incorrectAnswers.forEach(function (answer) {
             setTimeout(function() {
-                const answerButton = FindByAttributeValue("data-functional-selector", 'answer-' + answer, "button");
+                const answerButton = findAnswerButton(+answer);
                 if (answerButton) answerButton.style.backgroundColor = 'rgb(255, 0, 0)';
             }, 0);
         });
     }
 
     function answer(question, time) {
-        if (!question) return;
+        if (!question || !Array.isArray(question.answers)) return;
         Answered_PPT = PPT;
         var delay = (question.type == 'multiple_select_quiz') ? 60 : 0;
         setTimeout(function() {
             if (question.type == 'quiz') {
                 const answerIndex = +question.answers[0];
+                if (!Number.isFinite(answerIndex) || answerIndex < 0) return;
                 const answerButton = findAnswerButton(answerIndex);
-                if (answerButton) {
-                    answerButton.click();
+                if (answerButton && clickAnswerTarget(answerButton)) {
                 } else {
                     const key = (answerIndex + 1).toString();
                     const event = new KeyboardEvent('keydown', { key: key });
@@ -2181,11 +2226,12 @@
             if (question.type == 'multiple_select_quiz') {
                 question.answers.forEach(function(answerIndex) {
                     setTimeout(function() {
-                        const answerButton = findAnswerButton(+answerIndex);
-                        if (answerButton) {
-                            answerButton.click();
+                        const normalizedAnswerIndex = +answerIndex;
+                        if (!Number.isFinite(normalizedAnswerIndex) || normalizedAnswerIndex < 0) return;
+                        const answerButton = findAnswerButton(normalizedAnswerIndex);
+                        if (answerButton && clickAnswerTarget(answerButton)) {
                         } else {
-                            const key = (+answerIndex + 1).toString();
+                            const key = (normalizedAnswerIndex + 1).toString();
                             const event = new KeyboardEvent('keydown', { key: key });
                             window.dispatchEvent(event);
                         }
@@ -2207,8 +2253,11 @@
         if (Number.isFinite(questionIndex) && questionIndex >= 0) {
             info.questionNum = questionIndex;
         }
-        if (getAnswerButtons().length > 0 && info.lastAnsweredQuestion != info.questionNum) {
+        const answerTargets = getAnswerButtons();
+        const currentQuestionSignature = normalizeText(detectQuestionText());
+        if (answerTargets.length > 0 && (info.lastAnsweredQuestion != info.questionNum || (currentQuestionSignature && currentQuestionSignature !== info.lastQuestionSignature))) {
             info.lastAnsweredQuestion = info.questionNum;
+            info.lastQuestionSignature = currentQuestionSignature;
             onQuestionStart();
         }
         if (autoAnswer){
