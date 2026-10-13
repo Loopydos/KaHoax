@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         KaHoax
-// @version      1.1.4.1
+// @version      1.1.6.0
 // @description  A hack for kahoot.it! First tries proxy lookup by Quiz ID. If that fails, uses fallback search and displays a scrollable dropdown for selection.
 // @namespace    https://github.com/KRWCLASSIC
 // @match        https://kahoot.it/*
@@ -8,13 +8,14 @@
 // @grant        none
 // ==/UserScript==
 (function() {
-    var Version = '1.1.4.1';
+    var Version = '1.1.6.0';
 
     var questions = [];
     var info = {
         numQuestions: 0,
         questionNum: -1,
         lastAnsweredQuestion: -1,
+        lastQuestionSignature: '',
         defaultIL: true,
         ILSetQuestion: -1,
     };
@@ -24,6 +25,16 @@
     var showAnswers = false;
     var inputLag = 100; // Ping compensation
     var lastValidQuizID = null; // Store the last successfully loaded quiz ID
+    var autoFinderState = {
+        lastTitle: '',
+        lastQuestionSignature: '',
+        candidates: [],
+        titleLookupInProgress: false,
+        questionMatchInProgress: false,
+        resolved: false,
+        nextTickAt: 0
+    };
+    const quizDataCache = new Map();
 
     // Helper: Finds an element by attribute value.
     function FindByAttributeValue(attribute, value, element_type) {
@@ -55,6 +66,146 @@
         // UUID pattern: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
         const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
         return uuidPattern.test(str);
+    }
+
+    function normalizeText(text) {
+        if (!text) return '';
+        return text
+            .toString()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&nbsp;/g, ' ')
+            .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function getVisibleTextFromSelectors(selectors) {
+        for (const selector of selectors) {
+            const nodes = document.querySelectorAll(selector);
+            for (const node of nodes) {
+                if (!node) continue;
+                const style = window.getComputedStyle(node);
+                if (style && style.display === 'none') continue;
+                const text = (node.textContent || '').trim();
+                if (text) return text;
+            }
+        }
+        return '';
+    }
+
+    function detectQuizTitle() {
+        const titleFromDom = getVisibleTextFromSelectors([
+            '[data-functional-selector="game-title"]',
+            '[data-functional-selector="bottom-bar-game-title"]',
+            '[data-functional-selector="content-title"]',
+            '[data-selector="game-title"]',
+            '[class*="game-title"]',
+            '[class*="quiz-title"]'
+        ]);
+        if (titleFromDom) return titleFromDom;
+        const pageTitle = (document.title || '').replace(/\s*[-|–]\s*kahoot!?$/i, '').trim();
+        return pageTitle && pageTitle.toLowerCase() !== 'kahoot!' ? pageTitle : '';
+    }
+
+    function detectQuestionText() {
+        return getVisibleTextFromSelectors([
+            '[data-functional-selector="question-title"]',
+            '[data-functional-selector="question-text"]',
+            '[data-selector="question-title"]',
+            '[data-selector="question-text"]',
+            '[class*="question-title"]',
+            '[class*="question-text"]'
+        ]);
+    }
+
+    function getQuestionIndexFromUi() {
+        const counterCandidates = document.querySelectorAll('[data-functional-selector="question-index-counter"], [data-functional-selector*="question-index"], [data-selector*="question-index"]');
+        for (const node of counterCandidates) {
+            const raw = (node.textContent || '').trim();
+            if (!raw) continue;
+            const slashMatch = raw.match(/(\d+)\s*\/\s*\d+/);
+            if (slashMatch) return Math.max(0, Number(slashMatch[1]) - 1);
+            const singleMatch = raw.match(/\d+/);
+            if (singleMatch) return Math.max(0, Number(singleMatch[0]) - 1);
+        }
+        return info.questionNum;
+    }
+
+    function getAnswerButtons() {
+        const selectors = [
+            'button[data-functional-selector^="answer-"]',
+            '[data-functional-selector^="answer-"] button',
+            'button[data-selector^="answer-"]',
+            '[data-selector^="answer-"] button',
+            'button[data-testid^="answer-"]',
+            '[data-functional-selector^="answer-"][role="button"]',
+            '[data-selector^="answer-"][role="button"]',
+            '[data-testid^="answer-"][role="button"]'
+        ];
+        const seen = new Set();
+        const buttons = [];
+        selectors.forEach(selector => {
+            document.querySelectorAll(selector).forEach(node => {
+                const button = node.tagName === 'BUTTON' ? node : (node.closest('button') || node);
+                if (!button) return;
+                const key = button.getAttribute('data-functional-selector') || button.getAttribute('data-selector') || button.getAttribute('data-testid') || button.outerHTML.slice(0, 80);
+                if (seen.has(key)) return;
+                if (!button.isConnected || button.disabled) return;
+                seen.add(key);
+                buttons.push(button);
+            });
+        });
+        return buttons;
+    }
+
+    function findAnswerButton(index) {
+        const directSelectors = [
+            `button[data-functional-selector="answer-${index}"]`,
+            `[data-functional-selector="answer-${index}"] button`,
+            `button[data-selector="answer-${index}"]`,
+            `[data-selector="answer-${index}"] button`,
+            `button[data-testid="answer-${index}"]`,
+            `[data-functional-selector="answer-${index}"][role="button"]`,
+            `[data-selector="answer-${index}"][role="button"]`,
+            `[data-testid="answer-${index}"][role="button"]`
+        ];
+        for (const selector of directSelectors) {
+            const node = document.querySelector(selector);
+            if (!node) continue;
+            const button = node.tagName === 'BUTTON' ? node : (node.closest('button') || node);
+            if (button) return button;
+        }
+        const allButtons = getAnswerButtons();
+        return allButtons[index] || null;
+    }
+
+    function clickAnswerTarget(element) {
+        if (!element || !element.isConnected) return false;
+        try {
+            element.click();
+            return true;
+        } catch (e) {}
+        try {
+            ['mousedown', 'mouseup', 'click'].forEach(type => {
+                element.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+            });
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function resolveQuestionIndex() {
+        const uiIndex = getQuestionIndexFromUi();
+        if (Number.isFinite(uiIndex) && uiIndex >= 0 && uiIndex < questions.length) return uiIndex;
+        if (Number.isFinite(info.questionNum) && info.questionNum >= 0 && info.questionNum < questions.length) return info.questionNum;
+        if (questions.length > 0) {
+            const nextIndex = info.lastAnsweredQuestion + 1;
+            if (nextIndex >= 0 && nextIndex < questions.length) return nextIndex;
+            return Math.min(Math.max(info.lastAnsweredQuestion, 0), questions.length - 1);
+        }
+        return -1;
     }
 
     // Function to update the questions list in the browser
@@ -287,6 +438,9 @@
         info.numQuestions = 0;
         info.questionNum = -1;
         info.lastAnsweredQuestion = -1;
+        info.lastQuestionSignature = '';
+        autoFinderState.resolved = false;
+        autoFinderState.lastQuestionSignature = '';
         questionsLabel.textContent = 'Question 0 / ?';
         
         // Reset questions browser
@@ -301,20 +455,53 @@
         copyIcon.style.display = 'none';
     }
 
+    function createSectionHeader(text) {
+        const header = document.createElement('h2');
+        header.textContent = text;
+        header.className = 'kahoax-section-title';
+        header.style.display = 'block';
+        header.style.margin = '14px 0';
+        header.style.textAlign = 'center';
+        header.style.fontFamily = '"Montserrat", "Noto Sans Arabic", "Helvetica Neue", Helvetica, Arial, sans-serif';
+        header.style.fontSize = '1.12em';
+        header.style.fontWeight = '700';
+        header.style.letterSpacing = '0.6px';
+        header.style.color = 'white';
+        header.style.textShadow = '0 0 4px rgba(0, 0, 0, 0.4)';
+        return header;
+    }
+
+    function styleActionButton(button) {
+        button.classList.add('kahoax-action-btn');
+        button.style.width = '35px';
+        button.style.height = '35px';
+        button.style.backgroundColor = '#505a66';
+        button.style.color = 'white';
+        button.style.border = 'none';
+        button.style.borderRadius = '8px';
+        button.style.cursor = 'pointer';
+        button.style.display = 'flex';
+        button.style.justifyContent = 'center';
+        button.style.alignItems = 'center';
+        button.style.transition = 'transform 0.12s ease, background-color 0.2s ease';
+    }
+
     // --- UI Creation ---
     const uiElement = document.createElement('div');
     uiElement.className = 'floating-ui';
     uiElement.style.position = 'fixed';
     uiElement.style.top = '5%';
     uiElement.style.left = '5%';
-    uiElement.style.width = '350px';
-    uiElement.style.maxWidth = '90vw';
+    uiElement.style.width = '360px';
+    uiElement.style.maxWidth = '92vw';
     uiElement.style.height = 'auto';
     uiElement.style.maxHeight = '90vh'; // Limit height to 90% of viewport
     uiElement.style.overflowY = 'auto'; // Add vertical scrolling when needed
-    uiElement.style.backgroundColor = '#1e1e1e';
-    uiElement.style.borderRadius = '10px';
-    uiElement.style.boxShadow = '0px 0px 10px 0px rgba(0, 0, 0, 0.5)';
+    uiElement.style.background = 'linear-gradient(180deg, #1f232b 0%, #171a20 100%)';
+    uiElement.style.backdropFilter = 'blur(6px)';
+    uiElement.style.border = '1px solid rgba(255, 255, 255, 0.08)';
+    uiElement.style.borderRadius = '12px';
+    uiElement.style.boxShadow = '0 14px 28px rgba(0, 0, 0, 0.42)';
     uiElement.style.zIndex = '9999';
     uiElement.style.fontSize = '16px';
 
@@ -324,13 +511,13 @@
     handle.style.fontSize = '1em';
     handle.style.color = '#ffffff';
     handle.style.width = '100%';
-    handle.style.height = '40px';
-    handle.style.backgroundColor = '#2c2c2c';
-    handle.style.borderRadius = '10px 10px 0 0';
+    handle.style.height = '42px';
+    handle.style.background = 'linear-gradient(90deg, #2f3440 0%, #2a2f39 100%)';
+    handle.style.borderRadius = '12px 12px 0 0';
     handle.style.cursor = 'grab';
     handle.style.textAlign = 'left';
     handle.style.paddingLeft = '15px';
-    handle.style.lineHeight = '40px';
+    handle.style.lineHeight = '42px';
     handle.style.boxSizing = 'border-box';
     handle.style.display = 'flex';
     handle.style.alignItems = 'center';
@@ -369,11 +556,11 @@
     closeButton.style.position = 'absolute';
     closeButton.style.top = '0';
     closeButton.style.right = '0';
-    closeButton.style.width = '40px';
-    closeButton.style.height = '40px';
+    closeButton.style.width = '42px';
+    closeButton.style.height = '42px';
     closeButton.style.backgroundColor = '#ff4d4d';
     closeButton.style.color = 'white';
-    closeButton.style.borderRadius = '0 10px 0 0';
+    closeButton.style.borderRadius = '0 12px 0 0';
     closeButton.style.display = 'flex';
     closeButton.style.justifyContent = 'center';
     closeButton.style.alignItems = 'center';
@@ -387,9 +574,9 @@
     minimizeButton.style.color = 'white';
     minimizeButton.style.position = 'absolute';
     minimizeButton.style.top = '0';
-    minimizeButton.style.right = '40px';
-    minimizeButton.style.width = '40px';
-    minimizeButton.style.height = '40px';
+    minimizeButton.style.right = '42px';
+    minimizeButton.style.width = '42px';
+    minimizeButton.style.height = '42px';
     minimizeButton.style.backgroundColor = '#555555';
     minimizeButton.style.display = 'flex';
     minimizeButton.style.justifyContent = 'center';
@@ -399,15 +586,7 @@
     handle.appendChild(minimizeButton);
 
     // QUIZ ID/NAME
-    const headerText = document.createElement('h2');
-    headerText.textContent = 'QUIZ ID or NAME';
-    headerText.style.display = 'block';
-    headerText.style.margin = '15px 0';
-    headerText.style.textAlign = 'center';
-    headerText.style.fontFamily = '"Montserrat", "Noto Sans Arabic", "Helvetica Neue", Helvetica, Arial, sans-serif';
-    headerText.style.fontSize = '1.25em';
-    headerText.style.color = 'white';
-    headerText.style.textShadow = '0 0 5px rgba(0, 0, 0, 0.5)';
+    const headerText = createSectionHeader('QUIZ ID or NAME');
     uiElement.appendChild(headerText);
 
     // Input container (relative for the dropdown)
@@ -421,19 +600,21 @@
 
     const inputBox = document.createElement('input');
     inputBox.type = 'text';
+    inputBox.className = 'kahoax-input';
     inputBox.style.color = '#ffffff';
     inputBox.placeholder = 'Quiz Id or search for the Quiz here...';
     inputBox.style.width = '100%';
-    inputBox.style.height = '35px';
+    inputBox.style.height = '37px';
     inputBox.style.margin = '0';
     inputBox.style.padding = '0 10px';
-    inputBox.style.border = '1px solid #444444';
-    inputBox.style.borderRadius = '10px';
+    inputBox.style.border = '1px solid #4c5564';
+    inputBox.style.borderRadius = '9px';
     inputBox.style.outline = 'none';
     inputBox.style.textAlign = 'center';
     inputBox.style.fontSize = '0.9em';
-    inputBox.style.backgroundColor = '#333333';
+    inputBox.style.backgroundColor = '#2b313b';
     inputBox.style.boxSizing = 'border-box';
+    inputBox.style.transition = 'border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease';
     inputContainer.appendChild(inputBox);
 
     // If user manually clears input, reset
@@ -441,6 +622,19 @@
         if (inputBox.value.trim() === "") {
             resetUI();
         }
+    });
+    inputBox.addEventListener('focus', () => {
+        inputBox.style.borderColor = '#7c8cff';
+        inputBox.style.boxShadow = '0 0 0 2px rgba(124, 140, 255, 0.2)';
+    });
+    inputBox.addEventListener('blur', () => {
+        inputBox.style.boxShadow = 'none';
+        if (inputBox.style.backgroundColor === 'rgb(43, 49, 59)') {
+            inputBox.style.borderColor = '#4c5564';
+        }
+    });
+    inputBox.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') handleInputChange();
     });
 
     // Create button container for Enter, Copy, and Paste buttons
@@ -450,20 +644,11 @@
     buttonContainer.style.marginTop = '10px';
     buttonContainer.style.gap = '8px';
     buttonContainer.style.justifyContent = 'space-between';
+    buttonContainer.style.alignItems = 'center';
     
     // Kahoot button to open the quiz on kahoot.it
     const kahootButton = document.createElement('button');
-    kahootButton.style.width = '35px';
-    kahootButton.style.height = '35px';
-    kahootButton.style.backgroundColor = '#6c757d';
-    kahootButton.style.color = 'white';
-    kahootButton.style.border = 'none';
-    kahootButton.style.borderRadius = '5px';
-    kahootButton.style.cursor = 'pointer';
-    kahootButton.style.display = 'flex';
-    kahootButton.style.justifyContent = 'center';
-    kahootButton.style.alignItems = 'center';
-    kahootButton.style.transition = 'background-color 0.3s';
+    styleActionButton(kahootButton);
     kahootButton.title = 'Open quiz on Kahoot';
     
     // Use the Kahoot icon with white filter
@@ -495,11 +680,13 @@
     });
     
     kahootButton.addEventListener('mouseover', () => {
-        kahootButton.style.backgroundColor = '#5a6268';
+        kahootButton.style.backgroundColor = '#5d6977';
+        kahootButton.style.transform = 'translateY(-1px)';
     });
     
     kahootButton.addEventListener('mouseout', () => {
-        kahootButton.style.backgroundColor = '#6c757d';
+        kahootButton.style.backgroundColor = '#505a66';
+        kahootButton.style.transform = 'translateY(0)';
     });
     
     buttonContainer.appendChild(kahootButton);
@@ -508,38 +695,31 @@
     const enterButton = document.createElement('button');
     enterButton.textContent = 'Enter';
     enterButton.style.fontFamily = '"Montserrat", "Noto Sans Arabic", "Helvetica Neue", Helvetica, Arial, sans-serif'; 
+    enterButton.className = 'kahoax-enter-btn';
     enterButton.style.flexGrow = '1';
-    enterButton.style.height = '35px';
+    enterButton.style.height = '37px';
     enterButton.style.fontSize = '0.9em';
     enterButton.style.cursor = 'pointer';
-    enterButton.style.backgroundColor = '#6c757d';
+    enterButton.style.background = 'linear-gradient(90deg, #6f62ff 0%, #5778ff 100%)';
     enterButton.style.color = 'white';
     enterButton.style.border = 'none';
-    enterButton.style.borderRadius = '5px';
+    enterButton.style.borderRadius = '8px';
     enterButton.style.padding = '8px';
-    enterButton.style.transition = 'background-color 0.3s';
+    enterButton.style.transition = 'filter 0.2s ease, transform 0.12s ease';
     enterButton.addEventListener('click', handleInputChange);
     enterButton.addEventListener('mouseover', () => {
-        enterButton.style.backgroundColor = '#5a6268';
+        enterButton.style.filter = 'brightness(1.08)';
+        enterButton.style.transform = 'translateY(-1px)';
     });
     enterButton.addEventListener('mouseout', () => {
-        enterButton.style.backgroundColor = '#6c757d';
+        enterButton.style.filter = 'brightness(1)';
+        enterButton.style.transform = 'translateY(0)';
     });
     buttonContainer.appendChild(enterButton);
     
     // Copy button
     const copyButton = document.createElement('button');
-    copyButton.style.width = '35px';
-    copyButton.style.height = '35px';
-    copyButton.style.backgroundColor = '#6c757d';
-    copyButton.style.color = 'white';
-    copyButton.style.border = 'none';
-    copyButton.style.borderRadius = '5px';
-    copyButton.style.cursor = 'pointer';
-    copyButton.style.display = 'flex';
-    copyButton.style.justifyContent = 'center';
-    copyButton.style.alignItems = 'center';
-    copyButton.style.transition = 'background-color 0.3s';
+    styleActionButton(copyButton);
     copyButton.title = 'Copy verified Quiz ID';
     copyButton.innerHTML = `
         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -562,28 +742,20 @@
     });
     
     copyButton.addEventListener('mouseover', () => {
-        copyButton.style.backgroundColor = '#5a6268';
+        copyButton.style.backgroundColor = '#5d6977';
+        copyButton.style.transform = 'translateY(-1px)';
     });
     
     copyButton.addEventListener('mouseout', () => {
-        copyButton.style.backgroundColor = '#6c757d';
+        copyButton.style.backgroundColor = '#505a66';
+        copyButton.style.transform = 'translateY(0)';
     });
     
     buttonContainer.appendChild(copyButton);
     
     // Paste button
     const pasteButton = document.createElement('button');
-    pasteButton.style.width = '35px';
-    pasteButton.style.height = '35px';
-    pasteButton.style.backgroundColor = '#6c757d';
-    pasteButton.style.color = 'white';
-    pasteButton.style.border = 'none';
-    pasteButton.style.borderRadius = '5px';
-    pasteButton.style.cursor = 'pointer';
-    pasteButton.style.display = 'flex';
-    pasteButton.style.justifyContent = 'center';
-    pasteButton.style.alignItems = 'center';
-    pasteButton.style.transition = 'background-color 0.3s';
+    styleActionButton(pasteButton);
     pasteButton.title = 'Paste from clipboard';
     pasteButton.innerHTML = `
         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -628,11 +800,13 @@
     });
     
     pasteButton.addEventListener('mouseover', () => {
-        pasteButton.style.backgroundColor = '#5a6268';
+        pasteButton.style.backgroundColor = '#5d6977';
+        pasteButton.style.transform = 'translateY(-1px)';
     });
     
     pasteButton.addEventListener('mouseout', () => {
-        pasteButton.style.backgroundColor = '#6c757d';
+        pasteButton.style.backgroundColor = '#505a66';
+        pasteButton.style.transform = 'translateY(0)';
     });
     
     buttonContainer.appendChild(pasteButton);
@@ -691,15 +865,7 @@
     uiElement.appendChild(inputContainer);
 
     // ANSWERING
-    const header3 = document.createElement('h2');
-    header3.textContent = 'ANSWERING';
-    header3.style.display = 'block';
-    header3.style.margin = '15px 0';
-    header3.style.textAlign = 'center';
-    header3.style.fontFamily = '"Montserrat", "Noto Sans Arabic", "Helvetica Neue", Helvetica, Arial, sans-serif';
-    header3.style.fontSize = '1.25em';
-    header3.style.color = 'white';
-    header3.style.textShadow = '0 0 5px rgba(0, 0, 0, 0.5)';
+    const header3 = createSectionHeader('ANSWERING');
     uiElement.appendChild(header3);
 
     const answeringContainer = document.createElement('div');
@@ -1015,15 +1181,7 @@
     document.head.appendChild(scrollbarStyle);
 
     // INFO
-    const header4 = document.createElement('h2');
-    header4.textContent = 'INFO';
-    header4.style.display = 'block';
-    header4.style.margin = '15px 0';
-    header4.style.textAlign = 'center';
-    header4.style.fontFamily = '"Montserrat", "Noto Sans Arabic", "Helvetica Neue", Helvetica, Arial, sans-serif';
-    header4.style.fontSize = '1.25em';
-    header4.style.color = 'white';
-    header4.style.textShadow = '0 0 5px rgba(0, 0, 0, 0.5)';
+    const header4 = createSectionHeader('INFO');
     uiElement.appendChild(header4);
 
     // questionsLabel
@@ -1477,23 +1635,117 @@
         isDragging = false;
     });
 
+    async function fetchSearchResults(searchTerm) {
+        const searchUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/rest/kahoots/?query=' + encodeURIComponent(searchTerm);
+        const response = await fetch(searchUrl);
+        const data = await response.json();
+        const entities = Array.isArray(data?.entities) ? data.entities : [];
+        return entities
+            .map(entity => {
+                const card = entity.card || {};
+                return {
+                    title: card.title || card.name || 'No title',
+                    cover: card.cover || card.image || 'https://dummyimage.com/50x50/ccc/fff.png&text=No+Image',
+                    uuid: card.uuid || card.id || ''
+                };
+            })
+            .filter(item => item.uuid);
+    }
+
+    async function fetchQuizData(quizID) {
+        if (quizDataCache.has(quizID)) return quizDataCache.get(quizID);
+        const quizUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(quizID);
+        const response = await fetch(quizUrl);
+        if (!response.ok) throw new Error('Quiz lookup failed');
+        const data = await response.json();
+        quizDataCache.set(quizID, data);
+        return data;
+    }
+
+    async function loadQuizById(quizID, options = {}) {
+        const { updateInputColor = true } = options;
+        try {
+            const data = await fetchQuizData(quizID);
+            inputBox.value = quizID;
+            if (updateInputColor) inputBox.style.backgroundColor = 'green';
+            dropdown.style.display = 'none';
+            dropdownCloseButton.style.display = 'none';
+            questions = parseQuestions(data.questions || []);
+            info.numQuestions = questions.length;
+            lastValidQuizID = quizID;
+            autoFinderState.resolved = true;
+            updateQuestionsList(data.questions || []);
+            return true;
+        } catch (error) {
+            if (updateInputColor) inputBox.style.backgroundColor = 'red';
+            questions = [];
+            info.numQuestions = 0;
+            return false;
+        }
+    }
+
+    async function tryResolveQuizFromQuestion(questionText) {
+        const signature = normalizeText(questionText);
+        if (!signature || signature.length < 8 || autoFinderState.questionMatchInProgress || autoFinderState.resolved) return;
+        if (!autoFinderState.candidates.length || autoFinderState.lastQuestionSignature === signature) return;
+        autoFinderState.questionMatchInProgress = true;
+        autoFinderState.lastQuestionSignature = signature;
+        try {
+            for (const candidate of autoFinderState.candidates.slice(0, 8)) {
+                try {
+                    const data = await fetchQuizData(candidate.uuid);
+                    const hasMatchingQuestion = (data.questions || []).some(q => {
+                        const normalizedQuestion = normalizeText(q.question || '');
+                        return normalizedQuestion && (normalizedQuestion.includes(signature) || signature.includes(normalizedQuestion));
+                    });
+                    if (hasMatchingQuestion) {
+                        await loadQuizById(candidate.uuid, { updateInputColor: true });
+                        return;
+                    }
+                } catch (err) {
+                    console.error('Candidate check failed:', err);
+                }
+            }
+        } finally {
+            autoFinderState.questionMatchInProgress = false;
+        }
+    }
+
+    async function runAutoQuizFinder() {
+        if (autoFinderState.titleLookupInProgress) return;
+        const detectedTitle = detectQuizTitle();
+        const normalizedTitle = normalizeText(detectedTitle);
+        if (!normalizedTitle || normalizedTitle.length < 4) return;
+        if (autoFinderState.lastTitle === normalizedTitle && autoFinderState.candidates.length > 0) return;
+        autoFinderState.titleLookupInProgress = true;
+        try {
+            autoFinderState.lastTitle = normalizedTitle;
+            autoFinderState.lastQuestionSignature = '';
+            autoFinderState.resolved = false;
+            const candidates = await fetchSearchResults(detectedTitle);
+            autoFinderState.candidates = candidates.slice(0, 10);
+            const exactTitleMatches = autoFinderState.candidates.filter(candidate => normalizeText(candidate.title) === normalizedTitle);
+            if (exactTitleMatches.length === 1) {
+                await loadQuizById(exactTitleMatches[0].uuid, { updateInputColor: true });
+            }
+        } catch (error) {
+            console.error('Auto quiz finder failed:', error);
+        } finally {
+            autoFinderState.titleLookupInProgress = false;
+        }
+    }
+
     // --- Fallback Dropdown Search ---
     function searchPublicUUID(searchTerm) {
-        const searchUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/rest/kahoots/?query=' + encodeURIComponent(searchTerm);
-        console.log("Fallback search URL:", searchUrl);
-        fetch(searchUrl)
-          .then(response => response.json())
-          .then(data => {
-              console.log("Fallback search data:", data);
-              let results = (data.entities && data.entities.length > 0) ? data.entities : [];
+        fetchSearchResults(searchTerm)
+          .then(results => {
               dropdown.innerHTML = "";
               if (Array.isArray(results) && results.length > 0) {
                   dropdown.appendChild(dropdownHeader); // Re-add the header with X button
-                  results.forEach(entity => {
-                      let card = entity.card || {};
-                      let displayTitle = card.title || card.name || "No title";
-                      let displayCover = card.cover || card.image || 'https://dummyimage.com/50x50/ccc/fff.png&text=No+Image';
-                      let quizUUID = card.uuid || card.id || "";
+                  results.forEach(result => {
+                      let displayTitle = result.title;
+                      let displayCover = result.cover;
+                      let quizUUID = result.uuid;
                       const item = document.createElement('div');
                       item.style.display = 'flex';
                       item.style.alignItems = 'center';
@@ -1527,11 +1779,8 @@
                       item.appendChild(text);
                       
                     item.addEventListener('click', async function() {
-                        const quizUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(quizUUID);
                         try {
-                            const res = await fetch(quizUrl);
-                            if (!res.ok) throw new Error("Fetch failed");
-                            const data = await res.json();
+                            const data = await fetchQuizData(quizUUID);
                         
                             // If we already have the expanded view, do nothing (avoid duplicates)
                             if (item.classList.contains('expanded-item')) {
@@ -1540,17 +1789,6 @@
                             
                             // Mark this item as expanded
                             item.classList.add('expanded-item');
-                            
-                            // Save original item styles and content
-                            const originalItemStyles = {
-                                display: item.style.display,
-                                alignItems: item.style.alignItems,
-                                padding: item.style.padding,
-                                cursor: item.style.cursor,
-                                borderBottom: item.style.borderBottom,
-                                backgroundColor: item.style.backgroundColor,
-                            };
-                            const originalContent = item.innerHTML;
                             
                             // Clear existing content
                             item.innerHTML = '';
@@ -1810,12 +2048,12 @@
                                 selectButton.style.backgroundColor = '#6c757d';
                             });
 
-                            selectButton.addEventListener('click', (e) => {
+                            selectButton.addEventListener('click', async (e) => {
                                 e.stopPropagation(); // Prevent triggering the header click
                                 inputBox.value = quizUUID;
                                 dropdown.style.display = 'none';
                                 dropdownCloseButton.style.display = 'none';
-                                handleInputChange();
+                                await loadQuizById(quizUUID, { updateInputColor: true });
                             });
 
                             contentContainer.appendChild(selectButton);
@@ -1873,36 +2111,20 @@
     }
 
     // --- Lookup Function ---
-    function handleInputChange() {
+    async function handleInputChange() {
         var rawInput = inputBox.value;
         var quizID = sanitizeInput(rawInput);
-        const url = 'https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(quizID);
-        console.log("Direct lookup URL:", url);
         if (quizID !== "") {
-            fetch(url)
-                .then(response => {
-                    if (!response.ok) throw new Error('Direct lookup failed');
-                    return response.json();
-                })
-                .then(data => {
-                    console.log("Direct lookup data:", data);
-                    inputBox.style.backgroundColor = 'green';
-                    dropdown.style.display = 'none';
-                    dropdownCloseButton.style.display = 'none';
-                    questions = parseQuestions(data.questions);
-                    info.numQuestions = questions.length;
-                    lastValidQuizID = quizID; // Store the last valid quiz ID
-                    
-                    // Update the questions browser
-                    updateQuestionsList(data.questions);
-                })
-                .catch(error => {
-                    console.error("Direct lookup error:", error);
-                    inputBox.style.backgroundColor = 'red';
-                    info.numQuestions = 0;
-                    // Fallback: offer public search suggestions.
+            if (isValidGameId(quizID)) {
+                const loaded = await loadQuizById(quizID, { updateInputColor: true });
+                if (!loaded) {
                     searchPublicUUID(quizID);
-                });
+                }
+                return;
+            }
+            inputBox.style.backgroundColor = '#333333';
+            info.numQuestions = 0;
+            searchPublicUUID(quizID);
         } else {
             inputBox.style.backgroundColor = '#333333';
             info.numQuestions = 0;
@@ -1926,6 +2148,7 @@
     resizeObserver.observe(uiElement);
 
     function parseQuestions(questionsJson){
+        if (!Array.isArray(questionsJson)) return [];
         let questions = [];
         questionsJson.forEach(function (question){
             let q = {type: question.type, time: question.time};
@@ -1933,7 +2156,7 @@
                 var i = 0;
                 q.answers = [];
                 q.incorrectAnswers = [];
-                question.choices.forEach(function(choice){
+                (question.choices || []).forEach(function(choice){
                     if (choice.correct) {
                         q.answers.push(i);
                     } else {
@@ -1944,7 +2167,7 @@
             }
             if (question.type == 'open_ended') {
                 q.answers = [];
-                question.choices.forEach(function(choice){
+                (question.choices || []).forEach(function(choice){
                     q.answers.push(choice.answer);
                 });
             }
@@ -1955,63 +2178,90 @@
 
     function onQuestionStart(){
         console.log("onQuestionStart, inputLag =", inputLag);
-        var question = questions[info.questionNum];
+        const resolvedIndex = resolveQuestionIndex();
+        if (resolvedIndex < 0 || resolvedIndex >= questions.length) return;
+        info.questionNum = resolvedIndex;
+        var question = questions[resolvedIndex];
+        if (!question) return;
         if (showAnswers){
             highlightAnswers(question);
         }
         if (autoAnswer){
-            answer(question, (question.time - question.time / (500/(PPT-500))) - inputLag);
+            if (typeof question.time === 'number' && question.time > 0) {
+                answer(question, (question.time - question.time / (500/(PPT-500))) - inputLag);
+            } else {
+                answer(question, 0);
+            }
         }
     }
 
     function highlightAnswers(question){
+        if (!question || !Array.isArray(question.answers) || !Array.isArray(question.incorrectAnswers)) return;
         question.answers.forEach(function (answer) {
             setTimeout(function() {
-                const answerButton = FindByAttributeValue("data-functional-selector", 'answer-' + answer, "button");
+                const answerButton = findAnswerButton(+answer);
                 if (answerButton) answerButton.style.backgroundColor = 'rgb(0, 255, 0)';
             }, 0);
         });
         question.incorrectAnswers.forEach(function (answer) {
             setTimeout(function() {
-                const answerButton = FindByAttributeValue("data-functional-selector", 'answer-' + answer, "button");
+                const answerButton = findAnswerButton(+answer);
                 if (answerButton) answerButton.style.backgroundColor = 'rgb(255, 0, 0)';
             }, 0);
         });
     }
 
     function answer(question, time) {
+        if (!question || !Array.isArray(question.answers)) return;
         Answered_PPT = PPT;
         var delay = (question.type == 'multiple_select_quiz') ? 60 : 0;
         setTimeout(function() {
             if (question.type == 'quiz') {
-                const key = (+question.answers[0] + 1).toString();
-                const event = new KeyboardEvent('keydown', { key: key });
-                window.dispatchEvent(event);
+                const answerIndex = +question.answers[0];
+                if (!Number.isFinite(answerIndex) || answerIndex < 0) return;
+                const answerButton = findAnswerButton(answerIndex);
+                if (answerButton && clickAnswerTarget(answerButton)) {
+                } else {
+                    const key = (answerIndex + 1).toString();
+                    const event = new KeyboardEvent('keydown', { key: key });
+                    window.dispatchEvent(event);
+                }
             }
             if (question.type == 'multiple_select_quiz') {
-                question.answers.forEach(function(answer) {
+                question.answers.forEach(function(answerIndex) {
                     setTimeout(function() {
-                        const key = (+answer + 1).toString();
-                        const event = new KeyboardEvent('keydown', { key: key });
-                        window.dispatchEvent(event);
-                    }, 0);
+                        const normalizedAnswerIndex = +answerIndex;
+                        if (!Number.isFinite(normalizedAnswerIndex) || normalizedAnswerIndex < 0) return;
+                        const answerButton = findAnswerButton(normalizedAnswerIndex);
+                        if (answerButton && clickAnswerTarget(answerButton)) {
+                        } else {
+                            const key = (normalizedAnswerIndex + 1).toString();
+                            const event = new KeyboardEvent('keydown', { key: key });
+                            window.dispatchEvent(event);
+                        }
+                    }, 20);
                 });
                 setTimeout(function() {
-                    const submitButton = FindByAttributeValue("data-functional-selector", 'multi-select-submit-button', "button");
+                    const submitButton = FindByAttributeValue("data-functional-selector", 'multi-select-submit-button', "button") ||
+                        document.querySelector('button[data-selector="multi-select-submit-button"]') ||
+                        document.querySelector('button[data-testid="multi-select-submit-button"]');
                     if (submitButton) submitButton.click();
-                }, 0);
+                }, 120);
             }
-        }, time - delay);
+        }, Math.max(0, time - delay));
     }
 
     // Interval loop: checks question state, auto-answer logic, etc.
     setInterval(function () {
-        var textElement = FindByAttributeValue("data-functional-selector", "question-index-counter", "div");
-        if (textElement){
-            info.questionNum = +textElement.textContent - 1;
+        const questionIndex = getQuestionIndexFromUi();
+        if (Number.isFinite(questionIndex) && questionIndex >= 0) {
+            info.questionNum = questionIndex;
         }
-        if (FindByAttributeValue("data-functional-selector", 'answer-0', "button") && info.lastAnsweredQuestion != info.questionNum) {
+        const answerTargets = getAnswerButtons();
+        const currentQuestionSignature = normalizeText(detectQuestionText());
+        if (answerTargets.length > 0 && (info.lastAnsweredQuestion != info.questionNum || (currentQuestionSignature && currentQuestionSignature !== info.lastQuestionSignature))) {
             info.lastAnsweredQuestion = info.questionNum;
+            info.lastQuestionSignature = currentQuestionSignature;
             onQuestionStart();
         }
         if (autoAnswer){
@@ -2035,6 +2285,18 @@
         }
         // Update question label - use "?" for total if no questions loaded
         questionsLabel.textContent = 'Question ' + (info.questionNum + 1) + ' / ' + (info.numQuestions > 0 ? info.numQuestions : '?');
+
+        const now = Date.now();
+        if (now >= autoFinderState.nextTickAt) {
+            autoFinderState.nextTickAt = now + 1200;
+            if (!lastValidQuizID || info.numQuestions === 0) {
+                runAutoQuizFinder();
+            }
+            const liveQuestionText = detectQuestionText();
+            if (liveQuestionText) {
+                tryResolveQuizFromQuestion(liveQuestionText);
+            }
+        }
         
         // Check for game PIN
         try {
@@ -2174,6 +2436,19 @@
     // And add this style block to ensure toggle buttons are correctly sized and positioned:
     const toggleStyle = document.createElement('style');
     toggleStyle.textContent = `
+        .kahoax-section-title {
+            text-transform: uppercase;
+        }
+
+        .kahoax-action-btn:active,
+        .kahoax-enter-btn:active {
+            transform: translateY(0) scale(0.98) !important;
+        }
+
+        .kahoax-input::placeholder {
+            color: rgba(255, 255, 255, 0.68);
+        }
+
         .switch input:checked + .slider:before {
             transform: translateX(20px);
         }
@@ -2199,6 +2474,11 @@
                 left: 7.5vw;
                 font-size: 14px;
             }
+
+            .kahoax-section-title {
+                font-size: 1.05em !important;
+                margin: 12px 0 !important;
+            }
             
             .handle {
                 height: 35px;
@@ -2208,6 +2488,15 @@
             .close-button, .minimize-button {
                 width: 35px;
                 height: 35px;
+            }
+
+            .kahoax-action-btn {
+                width: 33px !important;
+                height: 33px !important;
+            }
+
+            .kahoax-enter-btn {
+                height: 33px !important;
             }
             
             .switch {
@@ -2242,6 +2531,15 @@
         
         /* Styles for very small screens - even smaller badges */
         @media (max-width: 355px) {
+            .kahoax-action-btn {
+                width: 30px !important;
+                height: 30px !important;
+            }
+
+            .kahoax-enter-btn {
+                font-size: 0.82em !important;
+            }
+
             .role-badge {
                 font-size: 0.525em !important; /* 0.7 * 0.75 */
                 padding: 1.5px 3.75px !important; /* 2px * 0.75, 5px * 0.75 */
