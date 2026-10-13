@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         KaHoax
-// @version      1.1.5.1
+// @version      1.1.6.0
 // @description  A hack for kahoot.it! First tries proxy lookup by Quiz ID. If that fails, uses fallback search and displays a scrollable dropdown for selection.
 // @namespace    https://github.com/KRWCLASSIC
 // @match        https://kahoot.it/*
@@ -8,7 +8,7 @@
 // @grant        none
 // ==/UserScript==
 (function() {
-    var Version = '1.1.5.1';
+    var Version = '1.1.6.0';
 
     var questions = [];
     var info = {
@@ -455,20 +455,53 @@
         copyIcon.style.display = 'none';
     }
 
+    function createSectionHeader(text) {
+        const header = document.createElement('h2');
+        header.textContent = text;
+        header.className = 'kahoax-section-title';
+        header.style.display = 'block';
+        header.style.margin = '14px 0';
+        header.style.textAlign = 'center';
+        header.style.fontFamily = '"Montserrat", "Noto Sans Arabic", "Helvetica Neue", Helvetica, Arial, sans-serif';
+        header.style.fontSize = '1.12em';
+        header.style.fontWeight = '700';
+        header.style.letterSpacing = '0.6px';
+        header.style.color = 'white';
+        header.style.textShadow = '0 0 4px rgba(0, 0, 0, 0.4)';
+        return header;
+    }
+
+    function styleActionButton(button) {
+        button.classList.add('kahoax-action-btn');
+        button.style.width = '35px';
+        button.style.height = '35px';
+        button.style.backgroundColor = '#505a66';
+        button.style.color = 'white';
+        button.style.border = 'none';
+        button.style.borderRadius = '8px';
+        button.style.cursor = 'pointer';
+        button.style.display = 'flex';
+        button.style.justifyContent = 'center';
+        button.style.alignItems = 'center';
+        button.style.transition = 'transform 0.12s ease, background-color 0.2s ease';
+    }
+
     // --- UI Creation ---
     const uiElement = document.createElement('div');
     uiElement.className = 'floating-ui';
     uiElement.style.position = 'fixed';
     uiElement.style.top = '5%';
     uiElement.style.left = '5%';
-    uiElement.style.width = '350px';
-    uiElement.style.maxWidth = '90vw';
+    uiElement.style.width = '360px';
+    uiElement.style.maxWidth = '92vw';
     uiElement.style.height = 'auto';
     uiElement.style.maxHeight = '90vh'; // Limit height to 90% of viewport
     uiElement.style.overflowY = 'auto'; // Add vertical scrolling when needed
-    uiElement.style.backgroundColor = '#1e1e1e';
-    uiElement.style.borderRadius = '10px';
-    uiElement.style.boxShadow = '0px 0px 10px 0px rgba(0, 0, 0, 0.5)';
+    uiElement.style.background = 'linear-gradient(180deg, #1f232b 0%, #171a20 100%)';
+    uiElement.style.backdropFilter = 'blur(6px)';
+    uiElement.style.border = '1px solid rgba(255, 255, 255, 0.08)';
+    uiElement.style.borderRadius = '12px';
+    uiElement.style.boxShadow = '0 14px 28px rgba(0, 0, 0, 0.42)';
     uiElement.style.zIndex = '9999';
     uiElement.style.fontSize = '16px';
 
@@ -478,13 +511,13 @@
     handle.style.fontSize = '1em';
     handle.style.color = '#ffffff';
     handle.style.width = '100%';
-    handle.style.height = '40px';
-    handle.style.backgroundColor = '#2c2c2c';
-    handle.style.borderRadius = '10px 10px 0 0';
+    handle.style.height = '42px';
+    handle.style.background = 'linear-gradient(90deg, #2f3440 0%, #2a2f39 100%)';
+    handle.style.borderRadius = '12px 12px 0 0';
     handle.style.cursor = 'grab';
     handle.style.textAlign = 'left';
     handle.style.paddingLeft = '15px';
-    handle.style.lineHeight = '40px';
+    handle.style.lineHeight = '42px';
     handle.style.boxSizing = 'border-box';
     handle.style.display = 'flex';
     handle.style.alignItems = 'center';
@@ -523,11 +556,11 @@
     closeButton.style.position = 'absolute';
     closeButton.style.top = '0';
     closeButton.style.right = '0';
-    closeButton.style.width = '40px';
-    closeButton.style.height = '40px';
+    closeButton.style.width = '42px';
+    closeButton.style.height = '42px';
     closeButton.style.backgroundColor = '#ff4d4d';
     closeButton.style.color = 'white';
-    closeButton.style.borderRadius = '0 10px 0 0';
+    closeButton.style.borderRadius = '0 12px 0 0';
     closeButton.style.display = 'flex';
     closeButton.style.justifyContent = 'center';
     closeButton.style.alignItems = 'center';
@@ -541,9 +574,9 @@
     minimizeButton.style.color = 'white';
     minimizeButton.style.position = 'absolute';
     minimizeButton.style.top = '0';
-    minimizeButton.style.right = '40px';
-    minimizeButton.style.width = '40px';
-    minimizeButton.style.height = '40px';
+    minimizeButton.style.right = '42px';
+    minimizeButton.style.width = '42px';
+    minimizeButton.style.height = '42px';
     minimizeButton.style.backgroundColor = '#555555';
     minimizeButton.style.display = 'flex';
     minimizeButton.style.justifyContent = 'center';
@@ -553,15 +586,7 @@
     handle.appendChild(minimizeButton);
 
     // QUIZ ID/NAME
-    const headerText = document.createElement('h2');
-    headerText.textContent = 'QUIZ ID or NAME';
-    headerText.style.display = 'block';
-    headerText.style.margin = '15px 0';
-    headerText.style.textAlign = 'center';
-    headerText.style.fontFamily = '"Montserrat", "Noto Sans Arabic", "Helvetica Neue", Helvetica, Arial, sans-serif';
-    headerText.style.fontSize = '1.25em';
-    headerText.style.color = 'white';
-    headerText.style.textShadow = '0 0 5px rgba(0, 0, 0, 0.5)';
+    const headerText = createSectionHeader('QUIZ ID or NAME');
     uiElement.appendChild(headerText);
 
     // Input container (relative for the dropdown)
@@ -575,19 +600,21 @@
 
     const inputBox = document.createElement('input');
     inputBox.type = 'text';
+    inputBox.className = 'kahoax-input';
     inputBox.style.color = '#ffffff';
     inputBox.placeholder = 'Quiz Id or search for the Quiz here...';
     inputBox.style.width = '100%';
-    inputBox.style.height = '35px';
+    inputBox.style.height = '37px';
     inputBox.style.margin = '0';
     inputBox.style.padding = '0 10px';
-    inputBox.style.border = '1px solid #444444';
-    inputBox.style.borderRadius = '10px';
+    inputBox.style.border = '1px solid #4c5564';
+    inputBox.style.borderRadius = '9px';
     inputBox.style.outline = 'none';
     inputBox.style.textAlign = 'center';
     inputBox.style.fontSize = '0.9em';
-    inputBox.style.backgroundColor = '#333333';
+    inputBox.style.backgroundColor = '#2b313b';
     inputBox.style.boxSizing = 'border-box';
+    inputBox.style.transition = 'border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease';
     inputContainer.appendChild(inputBox);
 
     // If user manually clears input, reset
@@ -595,6 +622,19 @@
         if (inputBox.value.trim() === "") {
             resetUI();
         }
+    });
+    inputBox.addEventListener('focus', () => {
+        inputBox.style.borderColor = '#7c8cff';
+        inputBox.style.boxShadow = '0 0 0 2px rgba(124, 140, 255, 0.2)';
+    });
+    inputBox.addEventListener('blur', () => {
+        inputBox.style.boxShadow = 'none';
+        if (inputBox.style.backgroundColor === 'rgb(43, 49, 59)') {
+            inputBox.style.borderColor = '#4c5564';
+        }
+    });
+    inputBox.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') handleInputChange();
     });
 
     // Create button container for Enter, Copy, and Paste buttons
@@ -604,20 +644,11 @@
     buttonContainer.style.marginTop = '10px';
     buttonContainer.style.gap = '8px';
     buttonContainer.style.justifyContent = 'space-between';
+    buttonContainer.style.alignItems = 'center';
     
     // Kahoot button to open the quiz on kahoot.it
     const kahootButton = document.createElement('button');
-    kahootButton.style.width = '35px';
-    kahootButton.style.height = '35px';
-    kahootButton.style.backgroundColor = '#6c757d';
-    kahootButton.style.color = 'white';
-    kahootButton.style.border = 'none';
-    kahootButton.style.borderRadius = '5px';
-    kahootButton.style.cursor = 'pointer';
-    kahootButton.style.display = 'flex';
-    kahootButton.style.justifyContent = 'center';
-    kahootButton.style.alignItems = 'center';
-    kahootButton.style.transition = 'background-color 0.3s';
+    styleActionButton(kahootButton);
     kahootButton.title = 'Open quiz on Kahoot';
     
     // Use the Kahoot icon with white filter
@@ -649,11 +680,13 @@
     });
     
     kahootButton.addEventListener('mouseover', () => {
-        kahootButton.style.backgroundColor = '#5a6268';
+        kahootButton.style.backgroundColor = '#5d6977';
+        kahootButton.style.transform = 'translateY(-1px)';
     });
     
     kahootButton.addEventListener('mouseout', () => {
-        kahootButton.style.backgroundColor = '#6c757d';
+        kahootButton.style.backgroundColor = '#505a66';
+        kahootButton.style.transform = 'translateY(0)';
     });
     
     buttonContainer.appendChild(kahootButton);
@@ -662,38 +695,31 @@
     const enterButton = document.createElement('button');
     enterButton.textContent = 'Enter';
     enterButton.style.fontFamily = '"Montserrat", "Noto Sans Arabic", "Helvetica Neue", Helvetica, Arial, sans-serif'; 
+    enterButton.className = 'kahoax-enter-btn';
     enterButton.style.flexGrow = '1';
-    enterButton.style.height = '35px';
+    enterButton.style.height = '37px';
     enterButton.style.fontSize = '0.9em';
     enterButton.style.cursor = 'pointer';
-    enterButton.style.backgroundColor = '#6c757d';
+    enterButton.style.background = 'linear-gradient(90deg, #6f62ff 0%, #5778ff 100%)';
     enterButton.style.color = 'white';
     enterButton.style.border = 'none';
-    enterButton.style.borderRadius = '5px';
+    enterButton.style.borderRadius = '8px';
     enterButton.style.padding = '8px';
-    enterButton.style.transition = 'background-color 0.3s';
+    enterButton.style.transition = 'filter 0.2s ease, transform 0.12s ease';
     enterButton.addEventListener('click', handleInputChange);
     enterButton.addEventListener('mouseover', () => {
-        enterButton.style.backgroundColor = '#5a6268';
+        enterButton.style.filter = 'brightness(1.08)';
+        enterButton.style.transform = 'translateY(-1px)';
     });
     enterButton.addEventListener('mouseout', () => {
-        enterButton.style.backgroundColor = '#6c757d';
+        enterButton.style.filter = 'brightness(1)';
+        enterButton.style.transform = 'translateY(0)';
     });
     buttonContainer.appendChild(enterButton);
     
     // Copy button
     const copyButton = document.createElement('button');
-    copyButton.style.width = '35px';
-    copyButton.style.height = '35px';
-    copyButton.style.backgroundColor = '#6c757d';
-    copyButton.style.color = 'white';
-    copyButton.style.border = 'none';
-    copyButton.style.borderRadius = '5px';
-    copyButton.style.cursor = 'pointer';
-    copyButton.style.display = 'flex';
-    copyButton.style.justifyContent = 'center';
-    copyButton.style.alignItems = 'center';
-    copyButton.style.transition = 'background-color 0.3s';
+    styleActionButton(copyButton);
     copyButton.title = 'Copy verified Quiz ID';
     copyButton.innerHTML = `
         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -716,28 +742,20 @@
     });
     
     copyButton.addEventListener('mouseover', () => {
-        copyButton.style.backgroundColor = '#5a6268';
+        copyButton.style.backgroundColor = '#5d6977';
+        copyButton.style.transform = 'translateY(-1px)';
     });
     
     copyButton.addEventListener('mouseout', () => {
-        copyButton.style.backgroundColor = '#6c757d';
+        copyButton.style.backgroundColor = '#505a66';
+        copyButton.style.transform = 'translateY(0)';
     });
     
     buttonContainer.appendChild(copyButton);
     
     // Paste button
     const pasteButton = document.createElement('button');
-    pasteButton.style.width = '35px';
-    pasteButton.style.height = '35px';
-    pasteButton.style.backgroundColor = '#6c757d';
-    pasteButton.style.color = 'white';
-    pasteButton.style.border = 'none';
-    pasteButton.style.borderRadius = '5px';
-    pasteButton.style.cursor = 'pointer';
-    pasteButton.style.display = 'flex';
-    pasteButton.style.justifyContent = 'center';
-    pasteButton.style.alignItems = 'center';
-    pasteButton.style.transition = 'background-color 0.3s';
+    styleActionButton(pasteButton);
     pasteButton.title = 'Paste from clipboard';
     pasteButton.innerHTML = `
         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -782,11 +800,13 @@
     });
     
     pasteButton.addEventListener('mouseover', () => {
-        pasteButton.style.backgroundColor = '#5a6268';
+        pasteButton.style.backgroundColor = '#5d6977';
+        pasteButton.style.transform = 'translateY(-1px)';
     });
     
     pasteButton.addEventListener('mouseout', () => {
-        pasteButton.style.backgroundColor = '#6c757d';
+        pasteButton.style.backgroundColor = '#505a66';
+        pasteButton.style.transform = 'translateY(0)';
     });
     
     buttonContainer.appendChild(pasteButton);
@@ -845,15 +865,7 @@
     uiElement.appendChild(inputContainer);
 
     // ANSWERING
-    const header3 = document.createElement('h2');
-    header3.textContent = 'ANSWERING';
-    header3.style.display = 'block';
-    header3.style.margin = '15px 0';
-    header3.style.textAlign = 'center';
-    header3.style.fontFamily = '"Montserrat", "Noto Sans Arabic", "Helvetica Neue", Helvetica, Arial, sans-serif';
-    header3.style.fontSize = '1.25em';
-    header3.style.color = 'white';
-    header3.style.textShadow = '0 0 5px rgba(0, 0, 0, 0.5)';
+    const header3 = createSectionHeader('ANSWERING');
     uiElement.appendChild(header3);
 
     const answeringContainer = document.createElement('div');
@@ -1169,15 +1181,7 @@
     document.head.appendChild(scrollbarStyle);
 
     // INFO
-    const header4 = document.createElement('h2');
-    header4.textContent = 'INFO';
-    header4.style.display = 'block';
-    header4.style.margin = '15px 0';
-    header4.style.textAlign = 'center';
-    header4.style.fontFamily = '"Montserrat", "Noto Sans Arabic", "Helvetica Neue", Helvetica, Arial, sans-serif';
-    header4.style.fontSize = '1.25em';
-    header4.style.color = 'white';
-    header4.style.textShadow = '0 0 5px rgba(0, 0, 0, 0.5)';
+    const header4 = createSectionHeader('INFO');
     uiElement.appendChild(header4);
 
     // questionsLabel
@@ -2432,6 +2436,19 @@
     // And add this style block to ensure toggle buttons are correctly sized and positioned:
     const toggleStyle = document.createElement('style');
     toggleStyle.textContent = `
+        .kahoax-section-title {
+            text-transform: uppercase;
+        }
+
+        .kahoax-action-btn:active,
+        .kahoax-enter-btn:active {
+            transform: translateY(0) scale(0.98) !important;
+        }
+
+        .kahoax-input::placeholder {
+            color: rgba(255, 255, 255, 0.68);
+        }
+
         .switch input:checked + .slider:before {
             transform: translateX(20px);
         }
@@ -2457,6 +2474,11 @@
                 left: 7.5vw;
                 font-size: 14px;
             }
+
+            .kahoax-section-title {
+                font-size: 1.05em !important;
+                margin: 12px 0 !important;
+            }
             
             .handle {
                 height: 35px;
@@ -2466,6 +2488,15 @@
             .close-button, .minimize-button {
                 width: 35px;
                 height: 35px;
+            }
+
+            .kahoax-action-btn {
+                width: 33px !important;
+                height: 33px !important;
+            }
+
+            .kahoax-enter-btn {
+                height: 33px !important;
             }
             
             .switch {
@@ -2500,6 +2531,15 @@
         
         /* Styles for very small screens - even smaller badges */
         @media (max-width: 355px) {
+            .kahoax-action-btn {
+                width: 30px !important;
+                height: 30px !important;
+            }
+
+            .kahoax-enter-btn {
+                font-size: 0.82em !important;
+            }
+
             .role-badge {
                 font-size: 0.525em !important; /* 0.7 * 0.75 */
                 padding: 1.5px 3.75px !important; /* 2px * 0.75, 5px * 0.75 */
